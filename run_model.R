@@ -2,11 +2,12 @@
 library(dplyr)
 library(rstan)
 source("simulate_data.R")
-options(mc.cores = parallel::detectCores()).
+options(mc.cores = parallel::detectCores())
 
 data <- read.table("CDNOW_sample.txt",col.names=c("rawcust","custid","date","qty","value")) %>% mutate(date=as.Date(as.character(date),format="%Y%m%d"))
 
-data <- read.table("CDNOW_master.txt",col.names=c("custid","date","qty","value")) %>% mutate(date=as.Date(as.character(date),format="%Y%m%d"))
+#data <- read.table("CDNOW_master.txt",col.names=c("custid","date","qty","value")) %>% mutate(date=as.Date(as.character(date),format="%Y%m%d"))
+
 end.date <- max(data$date)
 
 end.date <- as.Date("1997-09-30")
@@ -16,17 +17,42 @@ repeat.transactions <- data %>% group_by(custid) %>% do(data.frame(date = tail(u
 
 holdout <- data %>% filter(date > as.Date("1997-09-30"))%>% group_by(custid) %>% summarize(holdout.count=length(unique(date)))
 
-model <- stan_model("pnbd4.stan")
+Sys.setenv(R_MAKEVARS_USER=file.path(getwd(),"stan_makevars"))
 stan.data <- as.list(summarized)
 stan.data$NC <- nrow(summarized)
-out <- sampling(model,stan.data,chains=1,iter=500)
 
+#model <- stan_model("pnbd__adjust.stan")
+models <- list()
+results <- list()
+model.files <- c("pnbd_notransform","pnbd","pnbd_hypermean","pnbd_scale_adjust","pnbd_mean_var_adjust")
+
+
+for(i in model.files){
+    if(!is.null(results[[i]]))
+        next
+    models[[i]] <- stan_model(paste0(i,".stan"))
+    results[[i]] <- sampling(models[[i]],stan.data,chains=2,iter=1000)
+}
+
+save.image("out/image.rdata")
 #customer by date and customer by time matrices
-
+#slide 3-5
+#Slide 139 (p168)
 print(out,pars=c('buy_mean','buy_var','die_mean','die_var'),use_cache=FALSE)
-print(out,pars=c('r','alpha','s','beta','lp__'),use_cache=FALSE) 
 
-posterior <- extract(out,c('log_lambda','log_mu','Pactive','likelihood'))
+print(results[[2]],pars=c('r','alpha','s','beta','lp__'),use_cache=FALSE)
+
+print(results[[5]],pars=c('r','alpha','s','beta','log_lambda[1]','log_lambda[157]','log_mu[1]','log_mu[157]','lp__'),use_cache=FALSE)
+
+pairs(results[[2]],pars=c('r','alpha','s','beta','log_lambda[157]','log_mu[157]'))
+
+pairs(results[[2]],pars=c('log_buy_a','log_buy_b','log_die_a','log_die_b'))
+traceplot(results[[1]],pars=c('log_buy_a','log_buy_b','log_die_a','log_die_b'))
+traceplot(results[[2]],pars=c('r','alpha','s','beta','lp__'))
+
+extracted <- extract(out,pars=c('r','alpha','s','beta','log_buy_a','log_buy_b','log_die_a','log_die_b'))
+
+print(out,pars=c('log_lambda[1]','log_lambda[2]','log_lambda[100]'),use_cache=F)
 
 posterior.draw <- function(posterior,i){
   data.frame(lambda = exp(posterior$log_lambda[i,]),
@@ -66,3 +92,4 @@ ggplot(data.frame(week=1:max(weeks),count=as.numeric(table(cut(weeks,0:max(weeks
 #ggplot(data = predicted.weeks, aes(x=id+(end.date-min(data$date))/7, ymin=low,ymax=high))+geom_ribbon(color='blue',fill='blue',alpha=.1)
 
 
+#posterior <- extract(out,c('log_lambda','log_mu','Pactive','likelihood'))

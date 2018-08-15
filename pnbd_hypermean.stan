@@ -2,10 +2,10 @@
 
 #include /pnbd_data.stan
 parameters{
-  real log_r;
-  real log_alpha;
-  real log_s;
-  real log_beta;
+  real log_buy_a;
+  real log_buy_b;
+  real log_die_a;
+  real log_die_b;
 
   vector[NC] log_lambda;
   vector[NC] log_mu;
@@ -13,12 +13,17 @@ parameters{
 
 transformed parameters{
   vector[NC] likelihood;
+  vector[NC] lambdamu = exp(log_lambda) + exp(log_mu);
+  real log_r = log_buy_a;
+  real log_alpha = log_buy_a - log_buy_b;  
+  real log_s = log_die_b;
+  real log_beta = log_die_a - log_die_b;
+
   real r = exp(log_r);
   real alpha = exp(log_alpha);
   real s = exp(log_s);
   real beta = exp(log_beta);
-    
-  vector[NC] lambdamu = exp(log_lambda) + exp(log_mu);
+  
 #include /pnbdlikelihoodloop.stan
 }
 

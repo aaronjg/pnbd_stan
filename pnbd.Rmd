@@ -1,0 +1,258 @@
+---
+title: "Pareto/NBD Model for CLV in Stan"
+subtitle: "Stanford Stan User Group Meeting"
+author: "Aaron Goodman"
+date: "Aug 6, 2018"
+output:
+    pdf_document:
+        includes:
+            in_header: stanhl.tex
+    html_document:
+        includes:
+            in_header: stanhl.css
+header-includes:
+    - \usepackage{fancyvrb}
+    - \usepackage{color}
+
+urlcolor: blue
+---
+
+
+Introduction
+---
+This is a write up of my presentation for the Stan User Group meeting on August 6th, where we discussed non-linear transformations of variables to improve convergence in Stan models.
+
+To demonstrate these techniques, I used the Pareto/NBD model. The Pareto/NBD is a ``latent attrition'' model used to infer customer attributes and forecast repeat purchase behavior in continuous time, noncontractual settings (usually retail).
+
+While customer churn occurs in both contractual and noncontractual settings, it is more challenging to study in the noncontractual setting since the churn is unobserved. Rather than a customer explicitly contacting the supplier to end the relationship, the customer simply stops making purchases. Thus, to understand this churn process we use Bayesian modeling.
+
+I will briefly describe the Pareto/NBD model here, though other excellent and more thorough resources exist: [Profs. Fader and Hardie's tutorial on customer base analysis](http://www.brucehardie.com/talks/ho_cba_tut_art_09.pdf), their [concise treatment of the derivation of the model](http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.597.3165&rep=rep1&type=pdf), and [the original publication by Schmittlein _et al._ introducing the model](https://www.jstor.org/stable/2631608).
+
+Briefly, the Pareto/NBD model captures an individual customer's time of engagement with a firm via an exponential distribution with rate $\mu$, and while they are engaged with the firm, purchases are assumed to follow an exponential process, with rate $\lambda$. This leads to a Poisson distribution of purchases conditioned on the customer's lifetime. Heterogeneity across customers for the purchase rate and survival rate are each assumed to follow a gamma distribution with parameters $(r,\alpha)$ and $(s,\beta)$ respectively. Individual's purchase rates and survival rates are uncorrelated. The mixture of the exponential with the gamma leads to a Pareto type-II (_i.e._ Lomax) distribution, and the mixture of the gamma with the Poisson purchase count leads to a negative binomial distribution, and thus the combined distribution is the Pareto/NBD.
+
+This results in a customer-level likelihood of:
+$$
+L(\lambda,\mu|x,t_x,T) = \frac{\lambda^x \mu}{\lambda + \mu} e^{-(\lambda+\mu)t_x} + \frac{\lambda^{x+1}}{\lambda + \mu} e^{-(\lambda+\mu)T}
+$$
+Where $\lambda$ and $\mu$ are customer level parameters, $x$ is the number of repeat purchases the customer made, $t_x$ is the time between first and last purchase, and $T$ is the time from first purchase to the end of the observation period.
+
+In practice, the latent customer parameters $\lambda$ and $\mu$ can be marginalized out and the likelihood can be expressed in terms of a Gaussian Hypergeometirc function. However, for the purposes of this case study, we will be modeling these latent parameters in Stan.
+
+The Pareto/NBD model has a number of challenging aspects that make it an excellent illustrative tool for this case study. I will introduce these issues here and then discuss potential parameter transformations that could help alleviate them.
+
+The first issue is that hierarchical models can be challenging to fit in Stan without reparameterization. This is typically done using the non-centered parameterization of a distribution with location and scale parameters. However, the gamma distribution is parameterized by a shape and scale parameterization, so it does not lend itself easily to this transformation. The gamma distribution was initially chosen in this model it's mathematical ease as the conjugate prior to the exponential and Poisson distributions, which suggests an alternative distribution with location/scale parameters, such as the lognormal could be chosen to model customer heterogeneity. However, the gamma-distribution has a much heavier left tail than the log-normal, which turns out to be an essential feature for modeling the types of customer distributions present in real world datasets.
+
+A second issue is that arises from the gamma distribution is that the natural shape/scale parameterization tends to create a posterior distribution with correlation between these parameters. Such correlation can be difficult for Stan to fit using the diagonal mass matrix since it must use a smaller step-size to explore this distribution.
+
+A third issue relates to the trade off between the centered and non-centered parameterization of the model. Generally centered parameterizations work better when the latent parameters are informed mostly by the data, and non-centered parameterizations work better when the latent parameters are informed by the prior. The Pareto/NBD is a mix of these two scenarios. There are some customers with high purchase rates whose parameters are largely informed by their purchasing patterns, and there are many customers with one to two total purchases whose latent parameters are informed primarily by the parameters of the population-wide gamma distribution.
+
+Modeling
+----
+
+We will use the publicly available [CDNOW](http://www.brucehardie.com/datasets/) dataset. This is an anonymized dateset of customers of the now defunct CDNOW retailer who made their first purchase in the first quarter of 1997.
+
+```{r load data}
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+library(rstan)
+library(stanhl)
+options(mc.cores = parallel::detectCores(),width=100)
+Sys.setenv(R_MAKEVARS_USER=file.path(getwd(),"stan_makevars"))
+
+data <- read.table("CDNOW_sample.txt",
+                   col.names=c("rawcust","custid","date","qty","value")) %>%
+  mutate(date=as.Date(as.character(date),format="%Y%m%d"))
+```
+
+We then process and summarize the data. For each customer, the number of repeat purchases, time between first and last purchase, and time from first purchase to the end of the observation period are sufficient statistics, so we aggregate the data in this manner. We also segment the data in a test and holdout period. Holdout validation of this model was discussed in our March user group meeting.
+
+```{r process data}
+end.date <- max(data$date)
+
+end.date <- as.Date("1997-09-30")
+summarized <- data %>% filter(date <= as.Date("1997-09-30")) %>%
+  group_by(custid) %>%
+  summarize(p1x=length(unique(date))-1,
+            t = as.numeric(end.date - min(date))/7,
+            tx= as.numeric(max(date) - min(date))/7)
+
+repeat.transactions <- data %>%
+  group_by(custid) %>%
+  do(data.frame(date = tail(unique(.$date),-1))) %>% ungroup()
+
+holdout <- data %>% filter(date > as.Date("1997-09-30")) %>%
+  group_by(custid) %>%
+  summarize(holdout.count=length(unique(date)))
+
+stan.data <- as.list(summarized)
+stan.data$NC <- nrow(summarized)
+
+```
+
+Because we will be presenting this model and various transformations, it is helpful to put repeated parts of the model in separate files and include them using `#include` directives.
+
+```{r echo=FALSE,results='hide'}
+if(opts_knit$get("rmarkdown.pandoc.to") == "html"){
+  stanhl_html()
+}else{
+  .header.hi.html=""
+  stanhl_latex()
+}
+```
+
+```{r}
+showStan <- function(filename){
+  invisible(gsub("@","\\@",stanhl(readChar(filename,file.info(filename)$size)))) 
+}
+```
+```{r pareto NBD, comment=NA, results='asis' }
+showStan("pnbd_notransform.stan")
+showStan("pnbd_data.stan")
+showStan("pnbdlikelihoodloop.stan")
+showStan("pnbd_generatedquantities.stan")
+```
+
+```{r}
+models <- list()
+results <- list()
+```
+
+```{r pnbd notransform model, cache=TRUE, echo=FALSE,results='hide'}
+m <- "pnbd_notransform"
+models[[m]] <- stan_model(paste0(m,".stan"))
+results[[m]] <- sampling(models[[m]],stan.data,seed=123,chains=2,iter=1000)
+
+```
+
+```{r results first model,cache=TRUE}
+get_elapsed_time(results[[m]])
+which.max(stan.data$p1x)
+
+print(results[[m]],
+      pars=c('r','alpha','s','beta','log_lambda[1]','log_lambda[157]','log_mu[1]','log_mu[157]'),
+      use_cache=FALSE)
+suppressWarnings(pairs(results[[m]],pars=c('r','alpha','s','beta')))
+```
+
+
+The first transformation that we will make is by handling the positive constraints on the parameters ourselves. In the initial pass at the model, we let Stan constrain these parameters to be greater than zero. Stan does this by transforming the unconstrained parameters using an exponential transform. However, we subsequently transform them back on lines 18-19, and the `gamma_lpdf` function takes the log of the $r, \alpha, s,$ and $\beta$ parameters. The new model is below:
+
+By handling the transformation ourselves, we can avoid this redundant computation. We now model $\log(\lambda)$ and $\log(\mu)$ in the transformed parameter block. Now $\log(\lambda)$ and $\log(\mu)$ are distributed with an ExpGamma distribution. Stan does not currently have a function for this, so we handle this ourselves on lines 26-29.
+
+Where $x$ is distributed with a gamma distribution we have:
+
+$\mathcal{L}(x|r,\alpha) = r  \log(\alpha) - \log(\Gamma(r)) + (r - 1)  \log(x) - \alpha  x$
+
+And thus when we perform the change of variables, we have $\log(x)$ distributed ExpGamma:
+$\mathcal{L}(\log(x)|r,\alpha) = r  \log(\alpha) - \log(\Gamma(r)) + r  \log(x) - \alpha  x$
+
+We also handle the Jacobian for the $r, \alpha, s,$ and $\beta$ parameters on line 35.
+
+```{r pareto NBD transform, comment=NA, results='asis'}
+showStan("pnbd.stan")
+```
+
+```{r pnbd model transform, cache=TRUE,  results='hide'}
+m <- "pnbd"
+models[[m]] <- stan_model(paste0(m,".stan"))
+results[[m]] <- sampling(models[[m]],stan.data,seed=123,chains=2,iter=1000)
+
+```
+
+```{r}
+get_elapsed_time(results[[m]])
+print(results[[m]],
+      pars=c('r','alpha','s','beta','log_lambda[1]','log_lambda[157]','log_mu[1]','log_mu[157]'),
+      use_cache=FALSE)
+```
+
+We see that we arrive at essentially the same distribution for the hyperparameters. The transformations have resulted in approximately a 20\% speedup in the model, and there is slightly higher effective sample counts for the attrition rate parameters $s$, $\beta$ and $\mu$.
+
+We can also investigate ways to remove the correlations we observed in the hyperparameters. I typically do this by plotting transformations of the parameters to find a transformation that reduces the correlation. Here we can see that the correlation is reduced by parameterizing in terms of the log shape parameter and log mean of the gamma distribution, rather than using the natural shape and scale parameterization.
+
+```{r }
+p1 <- ggplot(as.data.frame(extract(results[[m]],pars=c('log_r','log_alpha','log_s','log_beta'))),
+             aes(x=log_r,y=log_alpha))+geom_point(alpha=.3)+theme_bw()
+p2 <- ggplot(as.data.frame(extract(results[[m]],pars=c('log_r','log_alpha','log_s','log_beta'))),
+             aes(x=log_r,y=log_r-log_alpha))+geom_point(alpha=.3)+theme_bw()
+
+p3 <- ggplot(as.data.frame(extract(results[[m]],pars=c('log_r','log_alpha','log_s','log_beta'))),
+             aes(x=log_s,y=log_beta))+geom_point(alpha=.3)+theme_bw()
+p4 <- ggplot(as.data.frame(extract(results[[m]],pars=c('log_r','log_alpha','log_s','log_beta'))),
+             aes(x=log_s,y=log_s-log_beta))+geom_point(alpha=.3)+theme_bw()
+
+traceplot(results[[m]],pars=c('r','alpha','s','beta'))
+grid.arrange(p1,p2,p3,p4)
+```
+
+We can incorporate this into our Stan model, and run the code:
+
+```{r, comment=NA, results='asis'}
+showStan("pnbd_hypermean.stan")
+```
+
+```{r pnbd model hypermean, cache=TRUE,  results='hide'}
+m <- "pnbd_hypermean"
+models[[m]] <- stan_model(paste0(m,".stan"))
+results[[m]] <- sampling(models[[m]],stan.data,seed=123,chains=2,iter=1000)
+```
+
+```{r}
+get_elapsed_time(results[[m]])
+print(results[[m]],
+      pars=c('r','alpha','s','beta','log_lambda[1]','log_lambda[157]','log_mu[1]','log_mu[157]'),
+      use_cache=FALSE)
+```
+
+
+This improves the convergence somewhat, increasing the effective sample count for $s$ and reducing the $\hat R$ for all of the population parameters. Most notably for $s$, $\hat R$ drops from 1.13 to 1.03. However, it is worth noting that not all metrics improve - the effective sample count for $\beta$ drops from 179 to 168.
+
+We next look at using the non-centered parameterization. Because the gamma distribution is a shape/scale rather than location/scale distribution, we cannot do the full noncentered parameterization. However, we can apply the transformation on the scaling parameter, which we do below, by parameterizing `log_lambda_raw` and `log_mu_raw`, computing the desired quantities in the transformed parameter block and placing a distribution on the `log_lambda_raw` and `log_mu_raw`. The full model is below. Note the significantly simplified expressions on line 29-32 using this parameterization.
+
+```{r, comment=NA, results='asis'}
+showStan("pnbd_scale_adjust.stan")
+```
+
+```{r pnbd model scale adjust, cache=TRUE,  results='hide'}
+m <- "pnbd_scale_adjust"
+models[[m]] <- stan_model(paste0(m,".stan"))
+results[[m]] <- sampling(models[[m]],stan.data,seed=123,chains=2,iter=1000)
+```
+```{r}
+get_elapsed_time(results[[m]])
+print(results[[m]],
+      pars=c('r','alpha','s','beta','log_lambda[1]','log_lambda[157]','log_mu[1]','log_mu[157]'),
+      use_cache=FALSE)
+```
+
+This parameterization seems to do notably worse than the centered parameterization. All of $\hat R$ and effective sample counts for the population parameters get worse. However, it appears that the inference of some of the  individual-level attrition parameters improve.
+
+Perhaps another transformation of the parameters will help. Rather than just using the scale transformation, we will use the first two moments of the ExpGamma distribution to reparameterize the distribution of the latent parameters. We have
+
+$E( \log \lambda | r, \alpha ) = \psi(r) - \log \alpha$ and $\mbox{Var}(\log \lambda | r, \alpha ) = \psi_1 (r)$ where $\psi$ and $\psi_1$ are the digamma and trigamma functions, respectively.
+
+
+```{r, comment=NA, results='asis',.numberLines}
+showStan("pnbd_mean_var_adjust.stan")
+
+```
+
+```{r pnbd model var adjust, cache=TRUE, results='hide'}
+m <- "pnbd_mean_var_adjust"
+models[[m]] <- stan_model(paste0(m,".stan"))
+results[[m]] <- sampling(models[[m]],stan.data,seed=123,chains=2,iter=1000)
+```
+```{r}
+get_elapsed_time(results[[m]])
+print(results[[m]],
+      pars=c('r','alpha','s','beta','log_lambda[1]','log_lambda[157]','log_mu[1]','log_mu[157]'),
+      use_cache=FALSE)
+```
+
+It appears that this transformation is just as bad as the previous. While the inference for the attrition parameters has improved somewhat, the performance for the purchase rate parameters has dropped.
+
+Conclusion
+---
+
+We looked at several reparameterizations of the Pareto/NBD model. The speed of the model was improved by about 20\% by manually implementing the positive constraints on the parameters and avoiding unneeded transformations between the constrained and unconstrained space. Further improvements were gained by parameterizing the gamma distribution in terms of it's shape parameter and mean, rather than shape and scale. Attempts to use a non-centered parameterization did not add further improvements to the model.
